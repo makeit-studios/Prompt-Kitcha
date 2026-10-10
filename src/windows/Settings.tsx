@@ -11,6 +11,9 @@ export default function Settings() {
   const [hasKey, setHasKey] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [inputLimitDraft, setInputLimitDraft] = useState("");
+  const [savingInputLimit, setSavingInputLimit] = useState(false);
   const [hotkeyDraft, setHotkeyDraft] = useState("");
   const [hotkeyError, setHotkeyError] = useState<string | null>(null);
   const [hotkeySuccess, setHotkeySuccess] = useState<string | null>(null);
@@ -22,6 +25,7 @@ export default function Settings() {
   useEffect(() => { (async () => {
     const [c, pl] = await Promise.all([ipc.getConfig(), ipc.listProviders()]);
     setCfg(c);
+    setInputLimitDraft(String(c.max_input_chars));
     setProviders(pl);
     setHotkeyDraft(c.hotkey);
     setHasKey(await ipc.hasApiKey(c.provider));
@@ -44,27 +48,59 @@ export default function Settings() {
   const active = providers.find((p) => p.id === cfg.provider);
 
   async function patch(p: Partial<AppConfig>) {
-    const next = await ipc.updateConfig(p);
-    setCfg(next);
-    if (p.provider) {
-      setHasKey(await ipc.hasApiKey(p.provider));
-      setApiKey("");
-      setTestResult(null);
+    setSettingsError(null);
+    try {
+      const next = await ipc.updateConfig(p);
+      setCfg(next);
+      if (p.provider) {
+        setHasKey(await ipc.hasApiKey(p.provider));
+        setApiKey("");
+        setTestResult(null);
+      }
+      return true;
+    } catch (error) {
+      setSettingsError(String(error));
+      return false;
+    }
+  }
+
+  async function saveInputLimit() {
+    const limit = Number(inputLimitDraft);
+    if (!Number.isSafeInteger(limit) || limit <= 0) {
+      setSettingsError("Maximum input characters must be a positive whole number.");
+      return;
+    }
+    setSavingInputLimit(true);
+    try {
+      await patch({ max_input_chars: limit });
+    } finally {
+      setSavingInputLimit(false);
     }
   }
 
   async function saveKey() {
     if (!apiKey.trim() || !cfg) return;
-    await ipc.setApiKey(cfg.provider, apiKey.trim());
-    setApiKey("");
-    setHasKey(true);
-    setTestResult(null);
+    setSettingsError(null);
+    try {
+      await ipc.setApiKey(cfg.provider, apiKey.trim());
+      setApiKey("");
+      setHasKey(true);
+      setTestResult(null);
+    } catch (error) {
+      setSettingsError(String(error));
+    }
   }
 
   async function removeKey() {
     if (!cfg) return;
-    await ipc.deleteApiKey(cfg.provider);
-    setHasKey(false);
+    setSettingsError(null);
+    try {
+      await ipc.deleteApiKey(cfg.provider);
+      setHasKey(false);
+      setTestResult(null);
+    } catch (error) {
+      setSettingsError(String(error));
+    }
   }
 
   async function testConn() {
@@ -88,7 +124,7 @@ export default function Settings() {
     try {
       const normalized = await ipc.validateHotkey(combo);
       await ipc.registerHotkey(normalized);
-      await patch({ hotkey: normalized, onboarded: true });
+      if (!await patch({ hotkey: normalized, onboarded: true })) return;
       setHotkeyDraft(normalized);
       setHotkeySuccess("Saved");
     } catch (e) {
@@ -152,6 +188,7 @@ export default function Settings() {
       </header>
 
       <div className="max-w-5xl mx-auto px-6 py-8">
+        {settingsError && <div role="alert" className="mb-4 rounded-lg bg-rose-950/50 p-3 text-sm text-rose-300">{settingsError}</div>}
         <div className="grid grid-cols-12 gap-8">
           {/* Sidebar */}
           <div className="col-span-3">
@@ -183,9 +220,42 @@ export default function Settings() {
               <>
                 <Card title="Behavior" description="Configure how PromptKitcha works">
                   <div className="space-y-4">
+                    <label className="block text-sm text-zinc-200">
+                      Enhancement mode
+                      <select
+                        className="mt-2 block w-full rounded-lg border border-zinc-700 bg-zinc-900 p-2"
+                        value={cfg.enhancement_mode}
+                        onChange={(e) => patch({ enhancement_mode: e.target.value as AppConfig["enhancement_mode"] })}
+                      >
+                        <option value="grounded">Instant grounded — original requirements, no API call</option>
+                        <option value="ai">AI enhanced — correct and reword with your provider</option>
+                      </select>
+                    </label>
+                    <div className="text-sm text-zinc-200">
+                      <label htmlFor="max-input-chars">Maximum input characters</label>
+                      <div className="mt-2 flex gap-2">
+                        <input
+                          id="max-input-chars"
+                          type="number"
+                          min={1}
+                          step={1}
+                          value={inputLimitDraft}
+                          onChange={(event) => setInputLimitDraft(event.target.value)}
+                          className="w-full rounded-lg border border-zinc-700 bg-zinc-900 p-2"
+                        />
+                        <button onClick={saveInputLimit} disabled={savingInputLimit} className="btn-primary">Save limit</button>
+                      </div>
+                      <p className="mt-1 text-xs text-zinc-400">No line-count limit. For long prompts, raise this above the full character count (for example, 100000). Over-limit requests are rejected, never silently shortened. AI model context limits still apply.</p>
+                    </div>
+                    <Toggle
+                      label="Start with Windows"
+                      description="Keep the shortcut available after you sign in"
+                      value={cfg.start_with_windows}
+                      onChange={(v) => patch({ start_with_windows: v })}
+                    />
                     <Toggle 
-                      label="Auto-replace selection after optimize"
-                      description="Automatically replace your selected text with the optimized version"
+                      label="Replace selection when accepted"
+                      description="Review the enhanced prompt, then choose Replace"
                       value={cfg.auto_replace} 
                       onChange={(v) => patch({ auto_replace: v })} 
                     />
@@ -245,6 +315,7 @@ export default function Settings() {
                       <label className="block text-sm font-medium text-zinc-300">Model</label>
                       <input
                         type="text"
+                        aria-label="Provider model"
                         value={cfg.model}
                         onChange={(e) => patch({ model: e.target.value })}
                         className="w-full px-4 py-3 rounded-xl bg-zinc-900 border border-zinc-800 text-white placeholder-zinc-500 focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
@@ -252,6 +323,15 @@ export default function Settings() {
                       />
                       {cfg.provider === "ollama" && (
                         <p className="text-xs text-zinc-500">Examples: llama3.1, qwen2.5, mistral</p>
+                      )}
+                      {cfg.provider === "groq" && (
+                        <p className="text-xs text-zinc-400">Uses Groq's API, not OpenAI's, even when the model name starts with openai/. Choose a model available to your Groq account.</p>
+                      )}
+                      {cfg.provider === "gemini" && (
+                        <p className="text-xs text-zinc-400">Uses the Google AI Studio Gemini API, not Vertex AI. Choose a text-generation model available to your API key.</p>
+                      )}
+                      {(cfg.provider === "groq" || cfg.provider === "gemini") && (
+                        <p className="text-xs text-zinc-400">BYOK: account quotas, free-tier availability, and any usage charges are controlled by the provider. Select AI enhanced under General to use this model.</p>
                       )}
                     </div>
                   </Card>
@@ -282,6 +362,7 @@ export default function Settings() {
                         <div className="flex gap-3">
                           <input
                             type="password"
+                            aria-label="Provider API key"
                             value={apiKey}
                             onChange={(e) => setApiKey(e.target.value)}
                             placeholder="Enter your API key"
@@ -305,7 +386,7 @@ export default function Settings() {
                   </Card>
                 )}
 
-                <Card title="Connection Test" description="Verify your API connection is working">
+                <Card title="Connection Test" description="Makes a small model request; provider quota or usage charges may apply">
                   <div className="flex items-center gap-4">
                     <button
                       onClick={testConn}
@@ -326,6 +407,7 @@ export default function Settings() {
                       </span>
                     )}
                   </div>
+                  {testResult?.startsWith("error:") && <p role="alert" className="mt-3 text-sm text-rose-400">{testResult.slice(7)}</p>}
                 </Card>
               </>
             )}

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { Sparkles, GripVertical, X } from "lucide-react";
 import { emit, listen } from "@tauri-apps/api/event";
 import { ipc } from "../lib/ipc";
@@ -6,11 +6,9 @@ import { ipc } from "../lib/ipc";
 export default function Pill() {
   const [hasFreshCopy, setHasFreshCopy] = useState(false);
   const [isHovered, setIsHovered] = useState(false);
-  const cachedText = useRef<string>("");
 
   useEffect(() => {
-    const un = listen<string>("pw:pill-shown", (e) => {
-      cachedText.current = e.payload ?? "";
+    const un = listen<string>("pw:pill-shown", () => {
       setHasFreshCopy(true);
       window.setTimeout(() => setHasFreshCopy(false), 5000);
     });
@@ -21,16 +19,12 @@ export default function Pill() {
 
   async function onClick() {
     await ipc.showPopupAtCursor();
-    let payload = cachedText.current;
-    if (!payload) {
-      try {
-        payload = await ipc.readClipboard();
-      } catch {
-        payload = "";
-      }
-    }
-    if (payload && payload.trim()) {
-      await emit("pw:selection-captured", payload);
+    try {
+      const payload = await ipc.readClipboard();
+      if (!payload.trim()) throw new Error("Copy your prompt as text first, then try again.");
+      await emit("pw:clipboard-captured", payload);
+    } catch (error) {
+      await emit("pw:capture-error", String(error));
     }
   }
 

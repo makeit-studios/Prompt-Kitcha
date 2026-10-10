@@ -127,6 +127,13 @@ async fn trigger(app: &AppHandle) -> Result<(), String> {
     }
     .await;
 
+    if let Err(error) = &result {
+        if let Some(win) = app.get_webview_window("popup") {
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+        let _ = app.emit("pw:capture-error", error);
+    }
     state.hotkey_busy.store(false, Ordering::Release);
     result
 }

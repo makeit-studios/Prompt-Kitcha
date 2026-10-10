@@ -22,6 +22,8 @@ import {
   ipc,
   onOptimize,
   onSelectionCaptured,
+  onClipboardCaptured,
+  onCaptureError,
   type Intent,
   type OptimizeEvent,
 } from "../lib/ipc";
@@ -100,8 +102,20 @@ export default function Popup() {
   const [intent, setIntent] = useState<Intent | "detecting">("detecting");
   const [output, setOutput] = useState("");
   const [status, setStatus] = useState<Status>("idle");
+  const [readyVersion, setReadyVersion] = useState(0);
+  const [manualPrompt, setManualPrompt] = useState("");
+  const [inputLimit, setInputLimit] = useState(10_000);
+  const [editorMode, setEditorMode] = useState(false);
+  const editorSessionId = useRef<number | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const [jobId, setJobId] = useState<number>(0);
+  const activeJob = useRef(0);
+  const nextJob = useRef(0);
+  const captureId = useRef<number | null>(null);
+  const revision = useRef(0);
+  const replacing = useRef(false);
+  const [applying, setApplying] = useState(false);
+  const [autoReplace, setAutoReplace] = useState(true);
+  const [timing, setTiming] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [feedback, setFeedback] = useState("");
   const [selectedTechnique, setSelectedTechnique] = useState<string>("standard");
@@ -110,53 +124,76 @@ export default function Popup() {
   const [comments, setComments] = useState<string>("");
   const [showComments, setShowComments] = useState(false);
   const [clipboardFallback, setClipboardFallback] = useState<string | null>(null);
-  const [optimizeButtonAnimating, setOptimizeButtonAnimating] = useState(false);
+  const [canReplace, setCanReplace] = useState(false);
   const [suggestedTechnique, setSuggestedTechnique] = useState<{ technique: PromptTechnique; reason: string } | null>(null);
   const lastOutputRef = useRef<string>("");
   const outRef = useRef<HTMLDivElement>(null);
+  const draftRef = useRef<HTMLTextAreaElement>(null);
+  const manualRef = useRef<HTMLTextAreaElement>(null);
   const techniqueDropdownRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const unlistens: Array<Promise<() => void>> = [];
     unlistens.push(
-      onSelectionCaptured((text) => {
-        setSource(text);
-        // Analyze input and suggest technique
-        const suggestion = suggestTechnique(text);
-        setSuggestedTechnique(suggestion);
-        runOptimize(text);
+      onSelectionCaptured((capture) => {
+        if (editorSessionId.current !== null) return;
+        startCaptured(capture.text, capture.replaceable ? capture.capture_id : null);
       })
     );
+    unlistens.push(onClipboardCaptured((text) => {
+      if (editorSessionId.current === null) startCaptured(text, null);
+    }));
     unlistens.push(
       onOptimize((ev: OptimizeEvent) => {
+        if (ev.job_id !== activeJob.current) return;
         if (ev.kind === "intent" && ev.intent) setIntent(ev.intent as Intent);
         else if (ev.kind === "delta" && ev.prompt_delta) {
           setOutput((p) => p + ev.prompt_delta);
           setStatus("streaming");
         } else if (ev.kind === "done") {
-          if (ev.full_prompt) {
-            setOutput(ev.full_prompt);
-            lastOutputRef.current = ev.full_prompt;
+          activeJob.current = 0;
+          if (!ev.full_prompt?.trim()) {
+            setErr("The enhancer returned an empty prompt. Try again.");
+            setStatus("error");
+            return;
           }
+          setOutput(ev.full_prompt);
+          lastOutputRef.current = ev.full_prompt;
+          setReadyVersion((version) => version + 1);
           if (ev.intent) setIntent(ev.intent as Intent);
+          setTiming(`${ev.mode === "grounded" ? "Instant" : "AI"} · ${ev.elapsed_ms} ms`);
           setStatus("done");
         } else if (ev.kind === "error") {
+          activeJob.current = 0;
           setErr(ev.error ?? "unknown error");
           setStatus("error");
-        } else if (ev.kind === "cancelled") setStatus("cancelled");
+        } else if (ev.kind === "cancelled") {
+          activeJob.current = 0;
+          setStatus("cancelled");
+        }
       })
     );
+    unlistens.push(onCaptureError((error) => {
+      if (editorSessionId.current !== null) return;
+      if (activeJob.current) ipc.cancel(activeJob.current).catch(() => {});
+      activeJob.current = 0;
+      revision.current += 1;
+      captureId.current = null;
+      lastOutputRef.current = "";
+      setFeedback("");
+      setSuggestedMethods([]);
+      setSuggestedTechnique(null);
+      setOutput("");
+      setSource("");
+      setCanReplace(false);
+      setClipboardFallback(null);
+      setErr(error);
+      setStatus("error");
+    }));
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close();
-      // Handle Ctrl+C for visual feedback
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c") {
-        if (output) {
-          e.preventDefault();
-          copy();
-          // Trigger Optimize button animation
-          setOptimizeButtonAnimating(true);
-          setTimeout(() => setOptimizeButtonAnimating(false), 600);
-        }
+      if (e.key === "Escape" && !e.isComposing && e.keyCode !== 229 && !replacing.current) {
+        e.preventDefault();
+        close();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -167,76 +204,213 @@ export default function Popup() {
   }, []);
 
   useEffect(() => {
-    if (outRef.current) outRef.current.scrollTop = outRef.current.scrollHeight;
-  }, [output]);
+    if (isBusy && outRef.current) outRef.current.scrollTop = outRef.current.scrollHeight;
+  }, [output, status]);
+
+  useEffect(() => {
+    if (status === "done") {
+      draftRef.current?.focus();
+      draftRef.current?.setSelectionRange(0, 0);
+    }
+  }, [status, readyVersion]);
+
+  useEffect(() => {
+    ipc.getConfig().then((cfg) => setInputLimit(cfg.max_input_chars)).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    ipc.getEditorSession().then((session) => {
+      if (disposed || !session) return;
+      editorSessionId.current = session.session_id;
+      setEditorMode(true);
+      if (session.text.trim()) startCaptured(session.text, null);
+    }).catch((error) => {
+      if (!disposed) setErr(String(error));
+    });
+    return () => { disposed = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!source) manualRef.current?.focus();
+  }, [source, status]);
+
+  function startCaptured(text: string, id: number | null) {
+    const currentRevision = ++revision.current;
+    captureId.current = id;
+    lastOutputRef.current = "";
+    setFeedback("");
+    setCopied(false);
+    setSelectedTechnique("standard");
+    setSuggestedMethods([]);
+    setComments("");
+    setShowComments(false);
+    setShowTechniqueDropdown(false);
+    setSource(text);
+    setManualPrompt(text);
+    setCanReplace(id !== null);
+    setClipboardFallback(editorSessionId.current !== null ? "OpenCode editor draft: Enter returns your edited prompt without submitting it. Esc keeps the original." : id !== null ? null : "No validated editable selection: edit the result, then press Enter to Copy & close. Paste manually into your prompt input. Automatic replacement is disabled.");
+    ipc.getConfig().then((cfg) => {
+      if (revision.current === currentRevision) {
+        setAutoReplace(cfg.auto_replace);
+        setInputLimit(cfg.max_input_chars);
+      }
+    }).catch(() => {});
+    setSuggestedTechnique(suggestTechnique(text));
+    runOptimize(text);
+  }
+
+  async function useCopiedText() {
+    try {
+      await ipc.showPopupAtCursor();
+      const text = await ipc.readClipboard();
+      if (!text.trim()) throw new Error("Copy your prompt as text first, then try again.");
+      startCaptured(text, null);
+    } catch (error) {
+      setErr(String(error));
+      setStatus("error");
+    }
+  }
+
+  function editSource() {
+    if (isBusy || replacing.current) return;
+    revision.current += 1;
+    captureId.current = null;
+    activeJob.current = 0;
+    setManualPrompt(source);
+    setSource("");
+    setOutput("");
+    lastOutputRef.current = "";
+    setFeedback("");
+    setCanReplace(false);
+    setClipboardFallback(null);
+    setSuggestedTechnique(null);
+    setSuggestedMethods([]);
+    setErr(null);
+    setStatus("idle");
+    ipc.getConfig().then((cfg) => setInputLimit(cfg.max_input_chars)).catch(() => {});
+  }
+
+  async function pastePrompt() {
+    const currentRevision = revision.current;
+    try {
+      const text = await ipc.readClipboard();
+      if (revision.current !== currentRevision || source) return;
+      if (!text.trim()) throw new Error("Copy your prompt as text first, then try again.");
+      setManualPrompt(text);
+      setErr(null);
+      manualRef.current?.focus();
+    } catch (error) {
+      if (revision.current === currentRevision) setErr(String(error));
+    }
+  }
+
+  function enhanceManualPrompt() {
+    if (!manualPrompt.trim() || isBusy || applying) return;
+    startCaptured(manualPrompt, null);
+  }
 
   async function runOptimize(text: string, opts?: { feedback?: string; previous?: string }) {
+    const priorId = activeJob.current;
+    const requestedId = Math.max(Date.now(), nextJob.current + 1);
+    nextJob.current = requestedId;
+    activeJob.current = requestedId;
     setOutput("");
+    setTiming(null);
     setErr(null);
     setIntent("detecting");
     setStatus("capturing");
     try {
+      if (priorId) await ipc.cancel(priorId).catch(() => {});
+      if (activeJob.current !== requestedId) return;
       const id = await ipc.optimize({
         text,
-        job_id: 0,
+        job_id: requestedId,
         feedback: opts?.feedback ?? null,
         previous_output: opts?.previous ?? null,
       });
-      setJobId(id);
+      if (activeJob.current !== requestedId) await ipc.cancel(id).catch(() => {});
     } catch (e: any) {
+      if (activeJob.current !== requestedId) return;
+      activeJob.current = 0;
       setErr(String(e));
       setStatus("error");
     }
   }
 
   async function refine() {
-    if (!source || !feedback.trim()) return;
-    if (jobId) await ipc.cancel(jobId).catch(() => {});
+    if (!source || !feedback.trim() || isBusy || applying) return;
     const prev = lastOutputRef.current;
-    await runOptimize(source, { feedback, previous: prev });
-    setFeedback("");
+    const instructions = feedback;
+    await runOptimize(source, { feedback: instructions, previous: prev });
   }
 
   async function accept() {
-    if (!output) return;
+    if (!output.trim() || status !== "done" || replacing.current) return;
+    const currentRevision = revision.current;
+    const originalCapture = captureId.current;
+    const editedDraft = output;
+    replacing.current = true;
+    setApplying(true);
+    setErr(null);
     try {
-      const cfg = await ipc.getConfig();
-      if (cfg.auto_replace) {
-        // Write to clipboard
-        await ipc.writeClipboard(output);
-        // Wait a moment then trigger paste via Rust (handles focus properly)
-        await new Promise((r) => setTimeout(r, 100));
-        await ipc.replaceSelection(output);
-        await new Promise((r) => setTimeout(r, 250));
-        // Now close popup
-        await ipc.hideWindow("popup");
-      } else {
-        await ipc.writeClipboard(output);
-        await ipc.hideWindow("popup");
+      if (editorSessionId.current !== null) {
+        await ipc.saveEditorPrompt(editedDraft, editorSessionId.current);
+        if (revision.current === currentRevision) await ipc.quit();
+        return;
       }
+      const cfg = await ipc.getConfig();
+      if (revision.current !== currentRevision) return;
+      setAutoReplace(cfg.auto_replace);
+      if (cfg.auto_replace && originalCapture !== null) {
+        await ipc.replaceSelection(editedDraft, originalCapture);
+      } else {
+        await ipc.writeClipboard(editedDraft);
+      }
+      if (revision.current === currentRevision) await ipc.hideWindow("popup");
     } catch (e) {
-      setErr(String(e));
+      if (revision.current === currentRevision) {
+        setErr(String(e));
+        await ipc.showWindow("popup").catch(() => {});
+      }
+    } finally {
+      replacing.current = false;
+      setApplying(false);
     }
   }
 
   async function copy() {
-    await ipc.writeClipboard(output);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1200);
+    if (!output.trim() || status !== "done" || replacing.current) return;
+    try {
+      await ipc.writeClipboard(output);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch (error) {
+      setErr(String(error));
+    }
   }
 
   async function regenerate() {
-    if (!source) return;
-    if (jobId) await ipc.cancel(jobId).catch(() => {});
+    if (!source || isBusy || applying) return;
     await runOptimize(source);
   }
 
   async function close() {
-    if (jobId && status === "streaming") await ipc.cancel(jobId).catch(() => {});
-    await ipc.hideWindow("popup");
+    if (replacing.current) return;
+    revision.current += 1;
+    captureId.current = null;
+    const current = activeJob.current;
+    activeJob.current = 0;
+    if (current) await ipc.cancel(current).catch(() => {});
+    if (editorSessionId.current !== null) {
+      await ipc.quit().catch((error) => setErr(String(error)));
+      return;
+    }
+    await ipc.hideWindow("popup").catch((error) => setErr(String(error)));
   }
 
   const isBusy = status === "streaming" || status === "capturing";
+  const willReplace = !editorMode && canReplace && autoReplace;
 
   const currentTechnique = promptTechniques.find((t) => t.id === selectedTechnique);
 
@@ -244,11 +418,10 @@ export default function Popup() {
     setSelectedTechnique(techniqueId);
     setShowTechniqueDropdown(false);
     setSuggestedTechnique(null); // Clear suggestion when user manually selects
-    if (source) {
+    if (source && !isBusy && !applying) {
       const result = generatePromptWithTechnique(techniqueId, source);
       setSuggestedMethods(result.suggestedMethods);
       // Re-run optimization with the new technique
-      if (jobId) ipc.cancel(jobId).catch(() => {});
       runOptimize(source);
     }
   };
@@ -260,8 +433,12 @@ export default function Popup() {
   };
 
   const applyMethod = (method: string) => {
+    if (status !== "done" || applying) return;
     const methodText = `\n${method}: [Add details here]`;
-    setOutput((prev) => prev + methodText);
+    const draft = output + methodText;
+    lastOutputRef.current = draft;
+    setOutput(draft);
+    draftRef.current?.focus();
   };
 
   // Close dropdown when clicking outside
@@ -293,7 +470,8 @@ export default function Popup() {
           <IntentBadge intent={intent} />
           <span className="text-[11px] font-medium text-zinc-700 dark:text-zinc-200 truncate flex items-center gap-1">
             {isBusy && <Loader2 size={11} className="animate-spin" />}
-            {statusLabel(status, source.length)}
+            {applying ? "Applying..." : statusLabel(status, source.length, willReplace, editorMode)}
+            {status === "done" && timing && <span className="ml-1 text-zinc-500">{timing}</span>}
           </span>
           <div className="flex-1" />
 
@@ -301,6 +479,7 @@ export default function Popup() {
           <div className="relative" ref={techniqueDropdownRef}>
             <button
               onClick={() => setShowTechniqueDropdown(!showTechniqueDropdown)}
+              disabled={isBusy || applying}
               className="btn-ghost text-xs flex items-center gap-1"
               title="Select prompt technique"
             >
@@ -333,7 +512,7 @@ export default function Popup() {
           <button onClick={() => ipc.showSettings()} className="btn-icon" title="Settings">
             <Settings2 size={14} />
           </button>
-          <button onClick={close} className="btn-icon" title="Close (Esc)">
+          <button onClick={close} disabled={applying} className="btn-icon" title="Close (Esc)">
             <X size={14} />
           </button>
         </div>
@@ -359,25 +538,79 @@ export default function Popup() {
 
         <div
           ref={outRef}
-          className="flex-1 overflow-auto px-4 py-3 text-[13px] leading-relaxed whitespace-pre-wrap
+          className="flex-1 min-h-0 overflow-auto px-4 py-3 text-[13px] leading-relaxed whitespace-pre-wrap
           text-zinc-800 dark:text-zinc-100 selection:bg-brand-500/25"
         >
-          {err ? (
-            <div className="flex gap-2 p-3 rounded-lg bg-rose-50 dark:bg-rose-500/10 ring-1 ring-rose-200 dark:ring-rose-500/20 text-rose-700 dark:text-rose-300">
+          {err && (
+            <div role="alert" className="flex gap-2 p-3 rounded-lg bg-rose-50 dark:bg-rose-500/10 ring-1 ring-rose-200 dark:ring-rose-500/20 text-rose-700 dark:text-rose-300">
               <AlertCircle size={16} className="shrink-0 mt-0.5" />
               <div>
                 <div className="font-semibold mb-0.5 text-[13px]">Something went wrong</div>
                 <div className="whitespace-pre-wrap text-xs opacity-90">{err}</div>
+                {!source && (
+                  <button onClick={useCopiedText} className="btn-ghost mt-2" title="Enhance the text you manually copied; never sends Ctrl+C to a terminal">
+                    <Copy size={12} /> Use copied text
+                  </button>
+                )}
               </div>
             </div>
-          ) : output ? (
+          )}
+          {!source ? (
+            <div className="flex flex-col h-full min-h-24 gap-2">
+              <textarea
+                ref={manualRef}
+                aria-label="Prompt to enhance"
+                aria-describedby="source-keyboard-help"
+                value={manualPrompt}
+                onChange={(event) => setManualPrompt(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter" || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+                  if (event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
+                  event.preventDefault();
+                  if (!event.repeat) enhanceManualPrompt();
+                }}
+                placeholder="Paste your complete prompt here, including multiple lines."
+                spellCheck={false}
+                className="w-full flex-1 min-h-16 resize-none bg-transparent outline-none text-[13px] leading-relaxed"
+              />
+              <div id="source-keyboard-help" className="text-[10px] text-zinc-500">
+                {manualPrompt ? manualPrompt.split(/\r\n|\r|\n/).length : 0} lines · {Array.from(manualPrompt).length.toLocaleString()} characters · limit {inputLimit?.toLocaleString()} · Enter: enhance · Shift+Enter: new line
+              </div>
+              <div className="flex gap-2">
+                <button onClick={pastePrompt} className="btn-ghost">Paste from clipboard</button>
+                <button onClick={enhanceManualPrompt} disabled={!manualPrompt.trim() || isBusy || applying} className="btn-primary">Enhance</button>
+              </div>
+            </div>
+          ) : status === "done" ? (
+            <textarea
+              ref={draftRef}
+              aria-label="Enhanced prompt"
+              aria-describedby="draft-keyboard-help"
+              value={output}
+              readOnly={applying}
+              onChange={(event) => {
+                setOutput(event.target.value);
+                lastOutputRef.current = event.target.value;
+                setCopied(false);
+                setErr(null);
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+                if (event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
+                event.preventDefault();
+                if (!event.repeat) accept();
+              }}
+              spellCheck={false}
+              className="w-full h-full min-h-24 resize-none bg-transparent outline-none text-[13px] leading-relaxed text-zinc-800 dark:text-zinc-100 selection:bg-brand-500/25"
+            />
+          ) : !err && output ? (
             <>
               {output}
               {status === "streaming" && (
                 <span className="inline-block w-[3px] h-[14px] bg-brand-500 animate-pulse-soft ml-0.5 align-middle rounded-sm" />
               )}
             </>
-          ) : (
+          ) : !err && (
             <div className="flex items-center gap-2 text-zinc-400">
               <Sparkles size={14} className="animate-pulse-soft" />
               <span className="text-xs font-medium">Optimizing your prompt…</span>
@@ -439,21 +672,22 @@ export default function Popup() {
         )}
 
         {/* Refine Input - Always Visible */}
-        <div className="flex items-center gap-2 px-3 py-2 border-t border-black/5 dark:border-white/10 bg-white/30 dark:bg-white/[0.02]">
+        {source && <div className="flex shrink-0 items-center gap-2 px-3 py-2 border-t border-black/5 dark:border-white/10 bg-white/30 dark:bg-white/[0.02]">
           <div className="relative flex-1">
-            <input
-              type="text"
+            <textarea
+              aria-label="Refinement instructions"
+              rows={2}
               value={feedback}
               onChange={(e) => setFeedback(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && feedback.trim()) {
+                if (e.key === "Enter" && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229 && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
                   e.preventDefault();
-                  refine();
+                  if (!e.repeat) refine();
                 }
               }}
               placeholder={status === "done" && !err ? "Refine — e.g. shorter, more casual, add a CTA…" : "Add instructions to improve the prompt…"}
-              disabled={!source || status === "streaming" || status === "capturing"}
-              className="w-full pl-3 pr-9 py-1.5 rounded-lg bg-white/80 dark:bg-zinc-800/70 text-xs
+              disabled={!source || isBusy || applying}
+              className="w-full resize-none overflow-auto pl-3 pr-9 py-1.5 rounded-lg bg-white/80 dark:bg-zinc-800/70 text-xs
               ring-1 ring-black/10 dark:ring-white/10 outline-none
               focus:ring-2 focus:ring-brand-500/50 focus:bg-white dark:focus:bg-zinc-800
               placeholder:text-zinc-400 transition text-zinc-900 dark:text-zinc-100
@@ -461,7 +695,7 @@ export default function Popup() {
             />
             <button
               onClick={refine}
-              disabled={!feedback.trim() || !source || status === "streaming" || status === "capturing"}
+              disabled={!feedback.trim() || !source || isBusy || applying}
               title="Refine (Enter)"
               className="absolute right-1 top-1/2 -translate-y-1/2 p-1.5 rounded-md
               text-brand-600 dark:text-brand-400
@@ -471,14 +705,15 @@ export default function Popup() {
               <SendHorizonal size={13} />
             </button>
           </div>
-        </div>
+        </div>}
 
-        <div className="flex items-center gap-1 px-2 py-2 border-t border-black/5 dark:border-white/10
+        <div className="flex shrink-0 flex-wrap items-center gap-1 px-2 py-2 border-t border-black/5 dark:border-white/10
         bg-zinc-50/60 dark:bg-zinc-950/40">
-          <button onClick={regenerate} className="btn-ghost" disabled={!source} title="Regenerate">
+          <button onClick={regenerate} className="btn-ghost" disabled={!source || isBusy || applying} title="Regenerate">
             <RefreshCw size={12} /> Regenerate
           </button>
-          <button onClick={copy} className="btn-ghost" disabled={!output} title="Copy">
+          <button onClick={editSource} className="btn-ghost" disabled={!source || isBusy || applying} title={editorMode ? "Edit the original OpenCode draft" : "Edit source as a new copy-only prompt"}>Edit source</button>
+          <button onClick={copy} className="btn-ghost" disabled={!output.trim() || status !== "done" || applying} title="Copy">
             {copied ? <Check size={12} className="text-emerald-500" /> : <Copy size={12} />}
             {copied ? "Copied" : "Copy"}
           </button>
@@ -499,27 +734,28 @@ export default function Popup() {
           <div className="flex-1" />
           <button
             onClick={accept}
-            disabled={!output || status === "streaming"}
-            className={clsx(
-              "btn-primary",
-              optimizeButtonAnimating && "animate-pulse ring-2 ring-brand-400"
-            )}
-            title="Replace selected text"
+            disabled={!output.trim() || status !== "done" || applying}
+            className="btn-primary"
+            title={editorMode ? "Return the edited draft to OpenCode (Enter); does not submit" : willReplace ? "Replace selected text (Enter)" : "Copy the result and close (Enter); paste manually"}
           >
-            <ArrowRightLeft size={12} strokeWidth={2.5} /> Replace
+            {applying ? <Loader2 size={12} className="animate-spin" /> : willReplace ? <ArrowRightLeft size={12} strokeWidth={2.5} /> : <Copy size={12} />}
+            {applying ? "Applying..." : editorMode ? "Return to OpenCode" : willReplace ? "Replace" : "Copy & close"}
           </button>
+        </div>
+        <div id="draft-keyboard-help" className="px-3 pb-1 text-[10px] text-zinc-500">
+          Enter: {editorMode ? "return draft to OpenCode (not submit)" : willReplace ? "replace selection" : "copy & close"} · Shift+Enter: new line · Esc: cancel
         </div>
       </div>
     </div>
   );
 }
 
-function statusLabel(s: Status, n: number): string {
+function statusLabel(s: Status, n: number, canReplace: boolean, editorMode: boolean): string {
   switch (s) {
     case "idle": return "";
     case "capturing": return `Captured ${n} chars`;
     case "streaming": return "Writing";
-    case "done": return "Ready — press Replace or Esc";
+    case "done": return editorMode ? "Edit, then Enter to return" : canReplace ? "Edit, then Enter to replace" : "Edit, then Enter to copy";
     case "error": return "Error";
     case "cancelled": return "Cancelled";
   }

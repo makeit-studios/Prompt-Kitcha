@@ -64,7 +64,6 @@ pub fn capture() -> AppHint {
 pub fn focus_hwnd(hwnd: isize) -> bool {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId,
         IsIconic, IsWindow, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
@@ -105,7 +104,6 @@ pub fn focus_hwnd(hwnd: isize) -> bool {
 
         let _ = BringWindowToTop(target);
         let ok = SetForegroundWindow(target).as_bool();
-        let _ = SetFocus(target);
 
         if attached_fg {
             let _ = AttachThreadInput(current_tid, fg_tid, false);

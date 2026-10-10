@@ -3,6 +3,23 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use crate::SharedState;
 
+pub fn sequence_number() -> u32 {
+    #[cfg(windows)]
+    unsafe {
+        windows::Win32::System::DataExchange::GetClipboardSequenceNumber()
+    }
+    #[cfg(not(windows))]
+    { 0 }
+}
+
+pub fn write_tracked(app: &AppHandle, state: &SharedState, text: &str) -> Result<(), String> {
+    let mut written = state.last_self_write.write();
+    *written = None;
+    app.clipboard().write_text(text.to_string()).map_err(|e| e.to_string())?;
+    *written = Some((sequence_number(), text.to_string()));
+    Ok(())
+}
+
 #[tauri::command]
 pub fn save_clipboard(app: AppHandle, state: State<'_, SharedState>) -> Result<(), String> {
     let text = app.clipboard().read_text().ok();
@@ -14,7 +31,7 @@ pub fn save_clipboard(app: AppHandle, state: State<'_, SharedState>) -> Result<(
 pub fn restore_clipboard(app: AppHandle, state: State<'_, SharedState>) -> Result<(), String> {
     let saved = state.saved_clipboard.write().take();
     if let Some(t) = saved {
-        app.clipboard().write_text(t).map_err(|e| e.to_string())?;
+        write_tracked(&app, state.inner(), &t)?;
     }
     Ok(())
 }
@@ -25,6 +42,6 @@ pub fn read_clipboard(app: AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn write_clipboard(app: AppHandle, text: String) -> Result<(), String> {
-    app.clipboard().write_text(text).map_err(|e| e.to_string())
+pub fn write_clipboard(app: AppHandle, state: State<'_, SharedState>, text: String) -> Result<(), String> {
+    write_tracked(&app, state.inner(), &text)
 }

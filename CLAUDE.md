@@ -7,6 +7,7 @@ Windows desktop app. Tauri v2. Rust + React. Grammarly for prompts.
 Select text → hotkey → LLM rewrites it → auto-replaces selection.
 
 ## Rules
+- Follow `AGENTS.md`: read complete repository READMEs, inspect folders, and read relevant source/configuration/tests before making claims; distinguish implementation from verified runtime behavior.
 - Reply ≤ 6 lines unless coding.
 - No preamble. No recap. No "I'll now…".
 - Skip ASCII diagrams, banners, emojis.

@@ -1,5 +1,16 @@
 # PromptKitcha - AI-Powered Prompt Optimizer for Everyone
 
+> This fork implements a Windows-first, free/BYOK prompt enhancer. Start with
+> [the Windows fork guide](WINDOWS_ENHANCER.md) for current modes, limitations,
+> build requirements, and verification steps. The upstream description below
+> includes platform and behavior claims that are not verified for this fork.
+
+OpenCode v2 integration uses its external-editor draft handoff: Ctrl+X then E
+opens the whole current prompt in PromptKitcha, and accepting returns the edited
+draft without submitting it. Setup is in the Windows fork guide. This is not
+automatic replacement of a mouse-selected terminal screen range, and live
+OpenCode GUI acceptance remains a manual check.
+
 PromptKitcha transforms rough text into powerful AI prompts with a single keystroke. Select text in any app, press `Ctrl+Shift+Space`, and watch it become a well-structured prompt ready for any LLM.
 
 Works everywhere on Windows, Mac, and Linux — Notepad, VS Code, Word, Slack, ChatGPT, Claude, and more.
@@ -13,7 +24,7 @@ Works everywhere on Windows, Mac, and Linux — Notepad, VS Code, Word, Slack, C
 - **Streaming Output**: Watch the prompt generate in real-time
 - **Auto-Replace**: Seamlessly replaces your selection with the optimized version
 - **Image Prompt Generation**: Create stunning AI image prompts from simple ideas
-- **Multiple Providers**: Use OpenAI, Anthropic, OpenRouter, or local Ollama
+- **Multiple Providers**: Use OpenAI, Anthropic, OpenRouter, Groq, Gemini, or local Ollama
 - **Self-Hosting Ready**: Full control, your API keys never leave your machine
 
 ## Quick Start
@@ -47,6 +58,8 @@ Generate creative image prompts from simple descriptions:
 | **OpenAI** | GPT-4o-mini | Yes |
 | **Anthropic** | Claude Haiku | Yes |
 | **OpenRouter** | 100+ models | Yes |
+| **Groq** | openai/gpt-oss-20b | Yes (Groq key) |
+| **Gemini** | gemini-3.5-flash-lite | Yes (Google AI Studio key) |
 | **Ollama** | llama3.1 | No (local) |
 
 API keys are stored in **system credential manager** — Windows Credential Manager, macOS Keychain, or Linux libsecret. Never stored in config files.
@@ -90,7 +103,7 @@ npm run tauri build
 
 ### Requirements
 - Windows 10/11 with WebView2 (ships with Win11)
-- API key from OpenAI/Anthropic/OpenRouter (or Ollama for local)
+- API key from OpenAI/Anthropic/OpenRouter/Groq/Google AI Studio (or Ollama for local)
 
 ## Usage
 
@@ -111,7 +124,7 @@ npm run tauri build
 3. Iterate until satisfied
 
 ### Settings
-- **Provider**: Choose OpenAI, Anthropic, OpenRouter, or Ollama
+- **Provider**: Choose OpenAI, Anthropic, OpenRouter, Groq, Gemini, or Ollama
 - **Model**: Select specific model per provider
 - **Hotkey**: Customize keyboard shortcut
 - **Auto-replace**: Toggle automatic text replacement

@@ -7,6 +7,10 @@ use crate::SharedState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    #[serde(default = "default_enhancement_mode")]
+    pub enhancement_mode: String,
+    #[serde(default)]
+    pub start_with_windows: bool,
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
     #[serde(default = "default_true")]
@@ -34,6 +38,7 @@ pub struct AppConfig {
 }
 
 fn default_hotkey() -> String { "CommandOrControl+Shift+Space".into() }
+fn default_enhancement_mode() -> String { "grounded".into() }
 fn default_true() -> bool { true }
 fn default_theme() -> String { "system".into() }
 fn default_provider() -> String { "openai".into() }
@@ -43,6 +48,8 @@ fn default_max_chars() -> usize { 10_000 }
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            enhancement_mode: default_enhancement_mode(),
+            start_with_windows: false,
             hotkey: default_hotkey(),
             show_pill_on_copy: true,
             theme: default_theme(),
@@ -92,6 +99,7 @@ pub fn get_config(state: State<'_, SharedState>) -> AppConfig {
 
 #[tauri::command]
 pub fn update_config(
+    app: tauri::AppHandle,
     state: State<'_, SharedState>,
     patch: serde_json::Value,
 ) -> Result<AppConfig, String> {
@@ -103,8 +111,34 @@ pub fn update_config(
         }
     }
     let new_cfg: AppConfig = serde_json::from_value(current).map_err(|e| e.to_string())?;
+    if !matches!(new_cfg.enhancement_mode.as_str(), "grounded" | "ai") {
+        return Err("Unknown enhancement mode.".into());
+    }
+    if new_cfg.max_input_chars == 0 {
+        return Err("Input limit must be greater than zero.".into());
+    }
+    let startup_changed = new_cfg.start_with_windows != cfg.start_with_windows;
+    if startup_changed {
+        use tauri_plugin_autostart::ManagerExt;
+        let autostart = app.autolaunch();
+        if new_cfg.start_with_windows {
+            autostart.enable().map_err(|e| e.to_string())?;
+        } else {
+            autostart.disable().map_err(|e| e.to_string())?;
+        }
+    }
+    if let Err(error) = new_cfg.save() {
+        if startup_changed {
+            use tauri_plugin_autostart::ManagerExt;
+            let autostart = app.autolaunch();
+            let rollback = if cfg.start_with_windows { autostart.enable() } else { autostart.disable() };
+            if let Err(rollback_error) = rollback {
+                return Err(format!("Could not save settings: {error}. Startup rollback also failed: {rollback_error}"));
+            }
+        }
+        return Err(error.to_string());
+    }
     *cfg = new_cfg.clone();
     drop(cfg);
-    new_cfg.save().map_err(|e| e.to_string())?;
     Ok(new_cfg)
 }

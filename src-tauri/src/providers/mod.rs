@@ -37,6 +37,7 @@ pub struct ChatRequest {
     pub user: String,
     pub temperature: f32,
     pub max_tokens: u32,
+    pub response_schema: Option<serde_json::Value>,
 }
 
 pub type ChunkStream =
@@ -66,6 +67,14 @@ pub fn build(name: &str, base_url: Option<&str>) -> Result<Box<dyn Provider>, Pr
         "openrouter" => Ok(Box::new(openrouter::OpenRouter::new(
             get_key_internal("openrouter"),
             normalized_base_url,
+        ))),
+        "groq" => Ok(Box::new(openai::OpenAi::compatible(
+            "groq", get_key_internal("groq"), normalized_base_url,
+            "https://api.groq.com/openai/v1",
+        ))),
+        "gemini" => Ok(Box::new(openai::OpenAi::compatible(
+            "gemini", get_key_internal("gemini"), normalized_base_url,
+            "https://generativelanguage.googleapis.com/v1beta/openai",
         ))),
         "ollama" => Ok(Box::new(ollama::Ollama::new(normalized_base_url))),
         other => Err(ProviderError::Unknown(other.into())),
@@ -106,6 +115,20 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             key_help_url: "https://openrouter.ai/keys",
         },
         ProviderInfo {
+            id: "groq",
+            label: "Groq",
+            needs_key: true,
+            default_model: "openai/gpt-oss-20b",
+            key_help_url: "https://console.groq.com/keys",
+        },
+        ProviderInfo {
+            id: "gemini",
+            label: "Gemini (Google AI Studio)",
+            needs_key: true,
+            default_model: "gemini-3.5-flash-lite",
+            key_help_url: "https://aistudio.google.com/apikey",
+        },
+        ProviderInfo {
             id: "ollama",
             label: "Ollama (local)",
             needs_key: false,
@@ -130,16 +153,40 @@ pub async fn test_connection(
         user: "ping".into(),
         temperature: 0.0,
         max_tokens: 8,
+        response_schema: None,
     };
-    let mut s = p.stream_chat(req).await.map_err(|e| e.to_string())?;
-    let mut out = String::new();
-    use futures_util::StreamExt;
-    while let Some(c) = s.next().await {
-        match c {
-            Ok(t) => out.push_str(&t),
-            Err(e) => return Err(e.to_string()),
+    let req = ChatRequest { max_tokens: if matches!(provider.as_str(), "groq" | "gemini") { 1024 } else { req.max_tokens }, ..req };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut s = p.stream_chat(req).await.map_err(|e| e.to_string())?;
+        let mut out = String::new();
+        use futures_util::StreamExt;
+        while let Some(c) = s.next().await {
+            out.push_str(&c.map_err(|e| e.to_string())?);
+            if out.len() > 32 { break; }
         }
-        if out.len() > 32 { break; }
+        if out.trim().is_empty() {
+            return Err("The provider returned no text. Check model availability and its output budget.".into());
+        }
+        Ok(out)
+    }).await.map_err(|_| "The connection test timed out after 30 seconds.".to_string())?;
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_keeps_existing_providers_and_adds_distinct_byok_entries() {
+        let providers = list_providers();
+        let mut ids: Vec<_> = providers.iter().map(|p| p.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["anthropic", "gemini", "groq", "ollama", "openai", "openrouter"]);
+        for (id, model) in [("groq", "openai/gpt-oss-20b"), ("gemini", "gemini-3.5-flash-lite")] {
+            let entry = providers.iter().find(|p| p.id == id).unwrap();
+            assert!(entry.needs_key);
+            assert_eq!(entry.default_model, model);
+            assert!(entry.key_help_url.starts_with("https://"));
+        }
     }
-    Ok(out)
 }

@@ -1,12 +1,16 @@
 mod clipboard;
 mod config;
 mod credentials;
+mod editor;
 mod cursor;
 mod foreground;
 mod hotkey;
+mod json_string;
 mod keystroke;
 mod optimizer;
 mod providers;
+mod prompt_builder;
+mod selection;
 mod tray;
 mod watcher;
 
@@ -21,9 +25,11 @@ use crate::config::AppConfig;
 pub struct AppState {
   pub config: RwLock<AppConfig>,
   pub saved_clipboard: RwLock<Option<String>>,
-  pub last_self_write: RwLock<Option<String>>,
+  pub last_self_write: RwLock<Option<(u32, String)>>,
   pub active_app: RwLock<Option<crate::foreground::AppHint>>,
+  pub captured_selection: RwLock<Option<keystroke::CapturedSelection>>,
   pub hotkey_busy: AtomicBool,
+  pub editor_session: RwLock<Option<editor::EditorSession>>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -38,12 +44,22 @@ pub fn run() {
     .init();
 
   let config = AppConfig::load().unwrap_or_default();
+  let editor_session = match editor::from_args(std::env::args_os().skip(1)) {
+    Ok(session) => session,
+    Err(error) => {
+      eprintln!("{error}");
+      std::process::exit(2);
+    }
+  };
+  let editor_mode = editor_session.is_some();
   let state: SharedState = Arc::new(AppState {
     config: RwLock::new(config),
     saved_clipboard: RwLock::new(None),
     last_self_write: RwLock::new(None),
     active_app: RwLock::new(None),
+    captured_selection: RwLock::new(None),
     hotkey_busy: AtomicBool::new(false),
+    editor_session: RwLock::new(editor_session),
   });
 
   tauri::Builder::default()
@@ -51,12 +67,15 @@ pub fn run() {
     .plugin(tauri_plugin_store::Builder::default().build())
     .plugin(tauri_plugin_opener::init())
     .plugin(tauri_plugin_dialog::init())
+    .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
     .plugin(tauri_plugin_global_shortcut::Builder::new().build())
     .manage(state.clone())
     .invoke_handler(tauri::generate_handler![
       optimizer::optimize_text,
       optimizer::cancel_optimize,
       optimizer::generate_image_prompt,
+      editor::get_editor_session,
+      editor::save_editor_prompt,
       keystroke::capture_selection,
       keystroke::replace_selection,
       clipboard::save_clipboard,
@@ -85,6 +104,10 @@ pub fn run() {
     ])
     .on_window_event(|window, event| {
       if let WindowEvent::CloseRequested { api, .. } = event {
+        if window.label() == "popup" && window.app_handle().state::<SharedState>().editor_session.read().is_some() {
+          window.app_handle().exit(0);
+          return;
+        }
         if window.label() == "popup" || window.label() == "pill" {
           api.prevent_close();
           let _ = window.hide();
@@ -94,6 +117,16 @@ pub fn run() {
     .setup({
       let state = state.clone();
       move |app| {
+        if editor_mode {
+          for label in ["settings", "pill", "image-prompt"] {
+            if let Some(win) = app.get_webview_window(label) { let _ = win.hide(); }
+          }
+          if let Some(win) = app.get_webview_window("popup") {
+            win.show()?;
+            win.set_focus()?;
+          }
+          return Ok(());
+        }
         tray::install(app.handle())?;
         hotkey::install_default(app.handle(), &state)?;
         watcher::spawn(app.handle().clone(), state.clone());
@@ -135,6 +168,10 @@ fn show_window(app: tauri::AppHandle, label: String) -> Result<(), String> {
 
 #[tauri::command]
 fn hide_window(app: tauri::AppHandle, label: String) -> Result<(), String> {
+  if label == "popup" && app.state::<SharedState>().editor_session.read().is_some() {
+    app.exit(0);
+    return Ok(());
+  }
   if let Some(win) = app.get_webview_window(&label) {
     win.hide().map_err(|e| e.to_string())?;
   }
@@ -169,7 +206,8 @@ fn show_settings(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn show_popup_at_cursor(app: tauri::AppHandle) -> Result<(), String> {
-  let state = app.state::<SharedState>();
+    let state = app.state::<SharedState>();
+    *state.captured_selection.write() = None;
   let fresh = foreground::capture();
   if !foreground::is_our_process(&fresh) {
     *state.active_app.write() = Some(fresh);
@@ -214,8 +252,14 @@ fn show_image_prompt(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn quit_app(app: tauri::AppHandle) {
+async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+  let editor_mode = app.state::<SharedState>().editor_session.read().is_some();
+  if editor_mode {
+    tauri::async_runtime::spawn_blocking(crate::keystroke::wait_for_modifiers)
+      .await.map_err(|e| e.to_string())??;
+  }
   app.exit(0);
+  Ok(())
 }
 
 fn park_pill_position(win: &tauri::WebviewWindow) -> Result<(i32, i32), String> {

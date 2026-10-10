@@ -3,7 +3,9 @@ import { INTENT_META } from "../lib/intents";
 import type { Intent } from "../lib/ipc";
 
 export function IntentBadge({ intent }: { intent: Intent | "detecting" }) {
-  const meta = INTENT_META[intent];
+  const meta = Object.prototype.hasOwnProperty.call(INTENT_META, intent)
+    ? INTENT_META[intent]
+    : INTENT_META.other;
   const Icon = meta.icon;
   const spinning = intent === "detecting";
   return (

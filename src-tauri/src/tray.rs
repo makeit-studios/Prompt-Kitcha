@@ -39,17 +39,17 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
             "optimize" => {
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
+                    if crate::show_popup_at_cursor(app.clone()).is_err() {
+                        return;
+                    }
                     let cb = tauri_plugin_clipboard_manager::ClipboardExt::clipboard(&app);
-                    if let Ok(text) = cb.read_text() {
-                        if let Some(win) = app.get_webview_window("popup") {
-                            let anchor = crate::cursor::get_popup_anchor(560, 360);
-                            if let Ok(p) = anchor {
-                                let _ = win.set_position(tauri::PhysicalPosition::new(p.x, p.y));
-                            }
-                            let _ = win.show();
-                            let _ = win.set_focus();
+                    match cb.read_text() {
+                        Ok(text) if !text.trim().is_empty() => {
+                            let _ = tauri::Emitter::emit(&app, "pw:clipboard-captured", text);
                         }
-                        let _ = tauri::Emitter::emit(&app, "pw:selection-captured", text);
+                        _ => {
+                            let _ = tauri::Emitter::emit(&app, "pw:capture-error", "Copy your prompt as text first, then try again.");
+                        }
                     }
                 });
             }

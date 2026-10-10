@@ -7,6 +7,8 @@ export type Intent =
   | "summarize" | "rewrite" | "brainstorm" | "data" | "other";
 
 export interface AppConfig {
+  enhancement_mode: "grounded" | "ai";
+  start_with_windows: boolean;
   hotkey: string;
   show_pill_on_copy: boolean;
   theme: string;
@@ -39,7 +41,20 @@ export interface OptimizeRequest {
   previous_output?: string | null;
 }
 
+export interface SelectionCapture {
+  capture_id: number;
+  replaceable: boolean;
+  text: string;
+}
+
+export interface EditorCapture {
+  session_id: number;
+  text: string;
+}
+
 export interface OptimizeEvent {
+  elapsed_ms: number;
+  mode: "grounded" | "ai";
   job_id: number;
   kind: "intent" | "delta" | "done" | "error" | "cancelled";
   intent?: string | null;
@@ -62,6 +77,9 @@ export interface ImagePromptGenResponse {
 
 export const ipc = {
   getConfig: () => invoke<AppConfig>("get_config"),
+  getEditorSession: () => invoke<EditorCapture | null>("get_editor_session"),
+  saveEditorPrompt: (text: string, sessionId: number) =>
+    invoke<void>("save_editor_prompt", { text, sessionId }),
   updateConfig: (patch: Partial<AppConfig>) =>
     invoke<AppConfig>("update_config", { patch }),
 
@@ -78,13 +96,14 @@ export const ipc = {
   hasApiKey: (provider: string) =>
     invoke<boolean>("has_api_key", { provider }),
 
-  captureSelection: () => invoke<string>("capture_selection"),
-  replaceSelection: (text: string) => invoke<void>("replace_selection", { text }),
+  captureSelection: () => invoke<SelectionCapture>("capture_selection"),
+  replaceSelection: (text: string, captureId: number) =>
+    invoke<void>("replace_selection", { text, captureId }),
   readClipboard: () => invoke<string>("read_clipboard"),
   writeClipboard: (text: string) => invoke<void>("write_clipboard", { text }),
 
   optimize: (req: OptimizeRequest) => invoke<number>("optimize_text", { req }),
-  cancel: (job_id: number) => invoke<void>("cancel_optimize", { job_id }),
+  cancel: (job_id: number) => invoke<void>("cancel_optimize", { jobId: job_id }),
 
   generateImagePrompt: (req: ImagePromptGenRequest) =>
     invoke<ImagePromptGenResponse>("generate_image_prompt", { req }),
@@ -110,7 +129,15 @@ export function onOptimize(
 }
 
 export function onSelectionCaptured(
-  handler: (text: string) => void
+  handler: (capture: SelectionCapture) => void
 ): Promise<UnlistenFn> {
-  return listen<string>("pw:selection-captured", (e) => handler(e.payload));
+  return listen<SelectionCapture>("pw:selection-captured", (e) => handler(e.payload));
+}
+
+export function onCaptureError(handler: (error: string) => void): Promise<UnlistenFn> {
+  return listen<string>("pw:capture-error", (e) => handler(e.payload));
+}
+
+export function onClipboardCaptured(handler: (text: string) => void): Promise<UnlistenFn> {
+  return listen<string>("pw:clipboard-captured", (e) => handler(e.payload));
 }
